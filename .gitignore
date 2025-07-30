@@ -1,0 +1,10 @@
+backend/__pycache__/
+__pycache__/
+clip_service.log
+.env
+data/
+logs/
+reference/
+summary/
+test/
+demo_tutorial_script.md
