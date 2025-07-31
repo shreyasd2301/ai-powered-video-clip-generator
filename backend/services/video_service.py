@@ -29,7 +29,7 @@ class VideoService:
         try:
             # Get or create spoken word collection (default)
             self.spoken_collection = self.conn.get_collection()
-            logger.info("Spoken word collection initialized")
+            # logger.info("Spoken word collection initialized")
         except Exception as e:
             logger.error(f"Failed to initialize spoken word collection: {str(e)}")
             raise Exception(f"Failed to initialize spoken word collection: {str(e)}")
@@ -37,17 +37,17 @@ class VideoService:
         try:
             # Get or create multimodal collection
             self.multimodal_collection = self._create_collection_if_not_exists("c-f5dcd278-5f63-4072-9818-eb820e1b1765")
-            logger.info("Multimodal collection initialized")
+            # logger.info("Multimodal collection initialized")
         except Exception as e:
             logger.error(f"Failed to initialize multimodal collection: {str(e)}")
             raise Exception(f"Failed to initialize multimodal collection: {str(e)}")
         
         self.videos_cache = {}
-        logger.info("VideoService initialized with separate collections")
+        # logger.info("VideoService initialized with separate collections")
     
     def _get_collection(self, index_type: str):
         """Get the appropriate collection based on index type"""
-        if index_type == "multimodal":
+        if index_type in ["multimodal", "scene"]:
             return self.multimodal_collection
         else:
             return self.spoken_collection
@@ -107,7 +107,7 @@ class VideoService:
                 "index_type": index_type,
                 "created_at": datetime.now(),
                 "custom_prompt": custom_prompt,
-                "collection": "multimodal" if index_type == "multimodal" else "spoken_word"
+                "collection": "multimodal" if index_type in ["multimodal", "scene"] else "spoken_word"
             }
             
             # Cache video info
@@ -155,12 +155,7 @@ class VideoService:
             
             # Index scenes
             scene_prompt = custom_prompt or """
-                1. **Character**: (e.g., "Speaker A", "Interviewee", "Host")
-                2. **Emotion**: Identify the dominant emotion depicted (e.g., happiness, nervousness, surprise).
-                3. **Facial Expression**: Describe face details (e.g., eyebrows raised, mouth slightly open, eyes narrowed).
-                4. **Action/Posture**: Describe what the character is doing (e.g., leaning forward, gesturing with hands, turning head).
-                5. **Background/Context**: Note surrounding elements (e.g., "plain white wall," "studio lights," "audience in blur," "office setting").
-                6. **Overall Mood/Ambiance**: Summarize tone and atmosphere (e.g., "intense and focused," "warmly conversational," "tension between speakers").
+                Describe the scene in 2-3 lines. Include the character, emotion, facial expression, action/posture, background/context, and overall mood/ambiance.
                 """
             scene_index_id = video.index_scenes(
                 extraction_type=SceneExtractionType.time_based,
@@ -194,6 +189,52 @@ class VideoService:
             logger.error(f"Failed to index video {video_id} for multimodal: {str(e)}")
             raise Exception(f"Failed to index video for multimodal: {str(e)}")
     
+    async def index_video_scene_only(self, video_id: str, custom_prompt: Optional[str] = None, scene_extract_time: Optional[int] = None) -> bool:
+        """Index video for scenes only (no spoken words)"""
+        logger.info(f"Indexing video {video_id} for scenes only")
+        try:
+            video = self.multimodal_collection.get_video(video_id)
+            
+            # Use provided scene_extract_time or default
+            extract_time = scene_extract_time if scene_extract_time is not None else DEFAULT_SCENE_EXTRACT_TIME
+            logger.info(f"Using scene extract time: {extract_time} seconds")
+            
+            # Index scenes only (no spoken words)
+            scene_prompt = custom_prompt or """
+                Describe the scene in 2-3 lines. Include the character, emotion, facial expression, action/posture, background/context, and overall mood/ambiance.
+                """
+            scene_index_id = video.index_scenes(
+                extraction_type=SceneExtractionType.time_based,
+                extraction_config={
+                    "time": extract_time,
+                    "select_frames": ['first', 'last', 'middle']
+                },
+                prompt=scene_prompt
+            )
+            
+            # Save scene index ID to JSON storage
+            self.scene_index_service.save_scene_index(
+                video_id=video_id,
+                scene_index_id=scene_index_id,
+                index_type="scene",
+                custom_prompt=custom_prompt
+            )
+            
+            # Update cache
+            if video_id in self.videos_cache:
+                self.videos_cache[video_id]["indexed"] = True
+                self.videos_cache[video_id]["scene_index_id"] = scene_index_id
+                self.videos_cache[video_id]["index_type"] = "scene"
+                self.videos_cache[video_id]["custom_prompt"] = custom_prompt
+                logger.debug(f"Cache updated for video {video_id}")
+            
+            logger.info(f"Scene-only indexing completed for video {video_id} with scene index {scene_index_id}")
+            return True
+        
+        except Exception as e:
+            logger.error(f"Failed to index video {video_id} for scenes only: {str(e)}")
+            raise Exception(f"Failed to index video for scenes only: {str(e)}")
+    
     async def get_video(self, video_id: str) -> Dict:
         """Get video details with proper index type detection"""
         logger.debug(f"Getting video with id={video_id}")
@@ -220,21 +261,36 @@ class VideoService:
                     "scene_index_id": None
                 }
                 
-                # Check if indexed
-                try:
-                    transcript = video.get_transcript()
-                    video_info["indexed"] = True
-                    logger.debug(f"Video {video_id} found in multimodal collection and is indexed")
-                except:
-                    video_info["indexed"] = False
-                    logger.debug(f"Video {video_id} found in multimodal collection but not indexed")
-                
-                # Get scene index information
+                # Get scene index information first
                 scene_index_info = self.scene_index_service.get_scene_index_info(video_id)
                 if scene_index_info:
                     video_info["scene_index_id"] = scene_index_info.scene_index_id
                     video_info["custom_prompt"] = scene_index_info.custom_prompt
-                    logger.debug(f"Video {video_id} has scene index {scene_index_info.scene_index_id}")
+                    # Determine index type based on scene index info
+                    if scene_index_info.index_type == "scene":
+                        video_info["index_type"] = "scene"
+                        # For scene-only indexing, consider it indexed if we have a scene index
+                        video_info["indexed"] = True
+                        logger.debug(f"Video {video_id} has scene index {scene_index_info.scene_index_id} with type {scene_index_info.index_type} - considered indexed")
+                    elif scene_index_info.index_type == "multimodal":
+                        video_info["index_type"] = "multimodal"
+                        # For multimodal, still check transcript
+                        try:
+                            transcript = video.get_transcript()
+                            video_info["indexed"] = True
+                            logger.debug(f"Video {video_id} found in multimodal collection and is indexed")
+                        except:
+                            video_info["indexed"] = False
+                            logger.debug(f"Video {video_id} found in multimodal collection but not indexed")
+                else:
+                    # No scene index, check transcript for traditional indexing
+                    try:
+                        transcript = video.get_transcript()
+                        video_info["indexed"] = True
+                        logger.debug(f"Video {video_id} found in multimodal collection and is indexed")
+                    except:
+                        video_info["indexed"] = False
+                        logger.debug(f"Video {video_id} found in multimodal collection but not indexed")
                     
             except:
                 # Try spoken word collection
@@ -252,21 +308,44 @@ class VideoService:
                         "scene_index_id": None
                     }
                     
-                    # Check if indexed
-                    try:
-                        transcript = video.get_transcript()
-                        video_info["indexed"] = True
-                        logger.debug(f"Video {video_id} found in spoken word collection and is indexed")
-                    except:
-                        video_info["indexed"] = False
-                        logger.debug(f"Video {video_id} found in spoken word collection but not indexed")
-                    
-                    # Get scene index information (even for spoken word videos, in case they were indexed for scenes)
+                    # Get scene index information first (even for spoken word videos, in case they were indexed for scenes)
                     scene_index_info = self.scene_index_service.get_scene_index_info(video_id)
                     if scene_index_info:
                         video_info["scene_index_id"] = scene_index_info.scene_index_id
                         video_info["custom_prompt"] = scene_index_info.custom_prompt
-                        logger.debug(f"Video {video_id} has scene index {scene_index_info.scene_index_id}")
+                        # If it has a scene index, update the index type and consider it indexed
+                        if scene_index_info.index_type == "scene":
+                            video_info["index_type"] = "scene"
+                            video_info["indexed"] = True
+                            logger.debug(f"Video {video_id} has scene index {scene_index_info.scene_index_id} with type {scene_index_info.index_type} - considered indexed")
+                        elif scene_index_info.index_type == "multimodal":
+                            video_info["index_type"] = "multimodal"
+                            # For multimodal, still check transcript
+                            try:
+                                transcript = video.get_transcript()
+                                video_info["indexed"] = True
+                                logger.debug(f"Video {video_id} found in spoken word collection and is indexed")
+                            except:
+                                video_info["indexed"] = False
+                                logger.debug(f"Video {video_id} found in spoken word collection but not indexed")
+                        else:
+                            # For spoken word with scene index, check transcript
+                            try:
+                                transcript = video.get_transcript()
+                                video_info["indexed"] = True
+                                logger.debug(f"Video {video_id} found in spoken word collection and is indexed")
+                            except:
+                                video_info["indexed"] = False
+                                logger.debug(f"Video {video_id} found in spoken word collection but not indexed")
+                    else:
+                        # No scene index, check transcript for traditional indexing
+                        try:
+                            transcript = video.get_transcript()
+                            video_info["indexed"] = True
+                            logger.debug(f"Video {video_id} found in spoken word collection and is indexed")
+                        except:
+                            video_info["indexed"] = False
+                            logger.debug(f"Video {video_id} found in spoken word collection but not indexed")
                         
                 except Exception as e:
                     logger.error(f"Video {video_id} not found in any collection: {str(e)}")
@@ -464,7 +543,9 @@ class VideoService:
                 # search_type=SearchType.semantic
                 limit=1
             )
-            # logger.info(f"Visual results: {results}")
+            for shot in results.get_shots():
+                safe_text = shot.text.encode('ascii', 'ignore').decode()
+                logger.info(f"Result: {shot.start} - {shot.end} - {safe_text}")
             return results
         except Exception as e:
             logger.error(f"Error searching visual content: {e}")

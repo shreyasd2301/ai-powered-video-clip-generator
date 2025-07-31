@@ -4,7 +4,7 @@ from datetime import datetime
 
 class VideoUploadRequest(BaseModel):
     video_url: Optional[str] = None
-    index_type: str = "multimodal"  # "spoken_word" or "multimodal"
+    index_type: str = "multimodal"  # "spoken_word", "multimodal", or "scene"
     custom_prompt: Optional[str] = None
     scene_extract_time: Optional[int] = 5  # Scene extraction time in seconds
     api_key: Optional[str] = None
@@ -12,7 +12,7 @@ class VideoUploadRequest(BaseModel):
 class ClipGenerationRequest(BaseModel):
     video_id: str
     user_query: str
-    index_type: str = "multimodal"
+    index_type: Optional[str] = None  # "spoken_word", "multimodal", or "scene" - auto-determined if None
     include_ranking: bool = True
     max_duration: Optional[int] = 180
     top_n: Optional[int] = 10

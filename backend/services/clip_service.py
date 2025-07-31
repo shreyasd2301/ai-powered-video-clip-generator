@@ -8,12 +8,9 @@ import asyncio
 from winreg import REG_RESOURCE_REQUIREMENTS_LIST
 from dotenv import load_dotenv
 
-# Import existing video_prompter functionality
-import sys
-sys.path.append('../..')
-
-from llm_agent import LLM
-from videodb import play_stream
+# Import LLM functionality from llm_service
+from services.llm_service import LLMService
+from videodb import play_stream, IndexType
 from videodb.timeline import Timeline, VideoAsset, ImageAsset, AudioAsset
 from services.logger_service import get_logger
 from services.video_service import VideoService
@@ -57,7 +54,7 @@ def generate_teaser_script(user_query, transcript):
     """Generate a teaser script for a video query"""
     logger.info(f"Generating teaser script for query: {user_query}")
     try:
-        llm = LLM()
+        llm_service = LLMService()
         prompt = f"""
         You are a creative scriptwriter and AI assistant. Your task is to extract the most emotionally intense or thought-provoking moment from a transcript and write a short teaser script. 
         This script will be used to locate the corresponding section in the video and generate short clips for social media or promotional use.
@@ -82,7 +79,7 @@ def generate_teaser_script(user_query, transcript):
         }}
         """
 
-        response = llm.chat(message=prompt)
+        response = llm_service.chat(message=prompt)
         output = response["choices"][0]["message"]["content"]
         import json
         res = json.loads(output)
@@ -96,14 +93,117 @@ def generate_teaser_script(user_query, transcript):
         logger.error(f"Failed to generate teaser script: {str(e)}")
         return ""
 
+def chunk_docs(docs, chunk_size):
+    """Chunk docs to fit into context of your LLM"""
+    for i in range(0, len(docs), chunk_size):
+        yield docs[i : i + chunk_size]
+
+def scene_prompter(scenes, prompt, llm_service):
+    """Scene prompter function migrated from reference/video_prompter.py"""
+    # chunk_size = 1000
+    # chunks = list(chunk_docs(scenes, chunk_size=chunk_size))
+    
+    matches = []
+    
+    for i, scene in enumerate(scenes):
+        i+=1
+        descriptions = [scene]
+        chunk_prompt = """
+        You are a video editor who uses AI. Given a user prompt and AI-generated scene descriptions of a video, analyze the descriptions to identify segments relevant to the user prompt for creating clips.
+
+        - **Instructions**: 
+            - Evaluate the scene descriptions for relevance to the specified user prompt.
+            - Choose description with the highest relevance and most comprehensive content.
+            - Optimize for engaging viewing experiences, considering visual appeal and narrative coherence.
+            - User Prompts: Interpret prompts like 'find exciting moments' or 'identify key plot points' by matching keywords or themes in the scene descriptions to the intent of the prompt.
+        """
+
+        chunk_prompt += f"""
+        Descriptions: {json.dumps(descriptions)}
+        User Prompt: {prompt}
+        """
+
+        chunk_prompt += """
+         **Output Format**: Return a JSON list of strings named 'sentences' that contains the output sentences. Ensure the final output
+        strictly adheres to the JSON format specified without including additional text or explanations. \
+        If there is no match return empty list without additional text. Use the following structure for your response:
+        {"sentences": [sentence1, sentence2, ...]}
+        """
+        
+        try:
+            response = llm_service.chat(message=chunk_prompt)
+            output = response["choices"][0]["message"]["content"]
+            res = json.loads(output)
+            sentences = res.get('sentences', [])
+            matches.extend(sentences)
+        except Exception as e:
+            logger.error(f"Scene prompter chunk failed: {str(e)}")
+    logger.info(f"Iterations: {i}")
+    return matches
+
 class ClipService:
     def __init__(self, api_key: Optional[str] = None):
         self.clips_cache = {}
-        self.llm = LLM()
+        self.llm_service = LLMService()
         self.api_key = api_key
         # Load existing clips from storage
         self.clips_cache = {clip['id']: clip for clip in load_clips_data()}
-        logger.info(f"ClipService initialized with {len(self.clips_cache)} existing clips")
+        # logger.info(f"ClipService initialized with {len(self.clips_cache)} existing clips")
+    
+    def search_scene_content(self, video_id: str, query: str) -> List[tuple]:
+        """Search scene content in video using scene prompter"""
+        try:
+            video_service = VideoService(api_key=self.api_key)
+            video = video_service.get_video_object(video_id)
+            
+            # Get scene index ID
+            scene_index_id = video_service.scene_index_service.get_scene_index_id(video_id)
+            logger.info(f"Scene index ID: {scene_index_id}")
+            if not scene_index_id:
+                logger.warning(f"No scene index found for video {video_id}")
+                return []
+            
+            # Get scenes
+            scenes = video.get_scene_index(scene_index_id)
+            # logger.info(f"Scenes: {scenes[0]}")
+            scenes_data = [scene["description"] for scene in scenes]
+            # logger.info(f"Scenes data: {scenes_data[:10]}")
+            # logger.info(f"Scenes data length: {len(scenes_data)}")
+            # https://console.videodb.io/player?url=https://stream.videodb.io/v3/published/manifests/e462a521-d025-44fe-a394-58d608f252ff.m3u8
+            if not scenes:
+                logger.warning(f"No scenes found for video {video_id}")
+                return []
+            
+            # Use scene prompter to get relevant scene descriptions
+            scene_descriptions = scene_prompter(scenes_data, query, self.llm_service)
+            logger.info(f"Scene prompter returned {len(scene_descriptions)} descriptions")
+            logger.info(f"Scene descriptions: {scene_descriptions}")
+            
+            # Search for each description in the video
+            scene_timestamps = []
+            for description in scene_descriptions:
+                try:
+                    search_result = video.search(
+                        query=description,
+                        index_type=IndexType.scene,
+                        search_type="semantic",
+                        scene_index_id=scene_index_id,
+                        # limit=1
+                    )
+                    shots = search_result.get_shots()
+                    if shots:
+                        shot = shots[0]
+                        scene_timestamps.append((shot.start, shot.end, description))
+                        logger.debug(f"Found scene match: {shot.start} - {shot.end} - {description[:50]}...")
+                except Exception as e:
+                    logger.error(f"Failed to search for scene description '{description[:50]}...': {str(e)}")
+            
+            logger.info(f"Scene search completed with {len(scene_timestamps)} timestamps")
+            return scene_timestamps
+            
+        except Exception as e:
+            logger.error(f"Failed to search scene content: {str(e)}")
+            return []
     
     async def _generate_timeline_segments(
         self,
@@ -114,64 +214,164 @@ class ClipService:
         max_duration: int = 180,
         top_n: Optional[int] = 10
     ) -> tuple:
-        """Generate timeline segments for a video query"""
-        video_service = VideoService(api_key=self.api_key)
-        video = video_service.get_video_object(video_id)
-        # Get transcript from video
+        """Generate timeline segments for a video query with improved error handling and efficiency"""
+        # Validate input parameters
+        if not video_id or not user_query:
+            raise ValueError("video_id and user_query are required")
+        
+        if index_type not in ["multimodal", "spoken_word", "scene"]:
+            raise ValueError(f"Invalid index_type: {index_type}. Must be one of: multimodal, spoken_word, scene")
+        
+        if max_duration <= 0:
+            raise ValueError("max_duration must be positive")
+        
+        if top_n is not None and top_n <= 0:
+            raise ValueError("top_n must be positive if specified")
+        
+        try:
+            video_service = VideoService(api_key=self.api_key)
+            video = video_service.get_video_object(video_id)
+        except Exception as e:
+            logger.error(f"Failed to initialize video service for video_id={video_id}: {str(e)}")
+            raise Exception(f"Failed to access video: {str(e)}")
 
-        transcript = video_service.get_transcript(video_id)
-        # logger.info(f"Transcript: {transcript}")
-
-        # Generate a script for a teaser clip
-        spoken_query, keywords = generate_teaser_script(user_query, transcript)
-
+        # Initialize result containers
         spoken_timestamps = []
-        for i, query in enumerate(spoken_query):
-            spoken_result = video_service.search_spoken_content(video_id, query)
-            spoken_timestamps.extend([(shot.start, shot.end, shot.text) for shot in spoken_result.get_shots()])
-        logger.info(f"Spoken timestamps: {spoken_timestamps}, length: {len(spoken_timestamps)}")
-
         visual_timestamps = []
-        if index_type == "multimodal":  
-            _, visual_query = self._divide_query(user_query)
-            logger.info(f"Visual query: {visual_query}")
-            for query in visual_query:
-                visual_result = video_service.search_visual_content(video_id, query)
-                visual_timestamps.extend([(shot.start, shot.end) for shot in visual_result.get_shots()])
-        
-        logger.info(f"Visual timestamps: {visual_timestamps}, length: {len(visual_timestamps)}")
+        spoken_query = ""
+        visual_query = ""
 
-        # Merge results
-        result = self._merge_transcript_intervals(spoken_timestamps)
-        logger.info(f"Combined results: {result}, count: {len(result)}")
+        # Process spoken content if needed
+        if index_type in ["multimodal", "spoken_word"]:
+            try:
+                # Get transcript and generate teaser script
+                transcript = video_service.get_transcript(video_id)
+                spoken_query, keywords = generate_teaser_script(user_query, transcript)
+                
+                # Search spoken content with error handling
+                if spoken_query and index_type != "scene":
+                    for i, query in enumerate(spoken_query):
+                        try:
+                            if not query.strip():
+                                continue
+                            spoken_result = video_service.search_spoken_content(video_id, query)
+                            shots = spoken_result.get_shots()
+                            for shot in shots:
+                                spoken_timestamps.append((shot.start, shot.end, shot.text))
+                            logger.debug(f"Query {i+1}/{len(spoken_query)}: Found {len(shots)} shots")
+                        except Exception as e:
+                            logger.warning(f"Failed to search spoken content for query {i+1}: {str(e)}")
+                            continue
+                    logger.info(f"Found {len(spoken_timestamps)} spoken timestamps")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to process spoken content: {str(e)}")
+                # Continue with visual search if spoken search fails
+
+        # Process visual content if needed
+        if index_type == "multimodal":
+            try:
+                _, visual_query = self._divide_query(user_query)
+                logger.info(f"Visual query: {visual_query}")
+                
+                if visual_query:
+                    try:
+                        visual_result = video_service.search_visual_content(video_id, visual_query)
+                        shots = visual_result.get_shots()
+                        for shot in shots:
+                            visual_timestamps.append((shot.start, shot.end, shot.text))
+                        logger.info(f"Found {len(visual_timestamps)} visual timestamps")
+                    except Exception as e:
+                        logger.warning(f"Failed to search visual content: {str(e)}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to process visual content: {str(e)}")
+                # Continue with scene search if visual search fails
+
+        # Process scene content if needed
+        if index_type == "scene":
+            try:
+                scene_timestamps = self.search_scene_content(video_id, user_query)
+                visual_timestamps = scene_timestamps
+                logger.info(f"Found {len(scene_timestamps)} scene timestamps")
+                
+            except Exception as e:
+                logger.warning(f"Failed to process scene content: {str(e)}")
+
+        # Merge and process results
+        all_timestamps = spoken_timestamps + visual_timestamps
         
-        # Apply ranking if requested
+        if not all_timestamps:
+            logger.warning(f"No video segments found for query: '{user_query}' with index_type: {index_type}")
+            raise Exception(f"No video segments found matching the query: '{user_query}'. Try a different query or check if the video contains the requested content.")
+        
+        # Merge overlapping intervals efficiently
+        result = self._merge_transcript_intervals(all_timestamps)
+        logger.info(f"Combined and merged results: {len(result)} segments")
+        
+        # Apply ranking if requested and multiple results exist
         if include_ranking and len(result) > 1:
-            logger.info("Applying ranking to results")
-            result = await self._rank_results(result, spoken_query, duration=max_duration)
+            try:
+                logger.info("Applying ranking to results")
+                ranking_query = self._build_ranking_query(visual_query, spoken_query, user_query)
+                logger.info(f"Ranking query: {ranking_query}")
+                result = await self._rank_results(result, ranking_query, duration=max_duration)
+                logger.info(f"Ranking completed, top result score: {result[0] if result else 'N/A'}")
+            except Exception as e:
+                logger.warning(f"Ranking failed, using original results: {str(e)}")
         
         # Limit results if specified
         if top_n and len(result) > top_n:
             logger.info(f"Limiting results to top {top_n}")
             result = result[:top_n]
         
-        # Check if any segments were found
-        if len(result) == 0:
-            logger.warning(f"No video segments found for query: '{user_query}' with index_type: {index_type}")
-            raise Exception(f"No video segments found matching the query: '{user_query}'. Try a different query or check if the video contains the requested content.")
-        
         return result, video_service
+
+
+
+    def _build_ranking_query(self, visual_query: str, spoken_query: str, original_query: str) -> str:
+        """Build an optimized query for ranking results"""
+        # Clean and validate queries
+        visual_query = visual_query.strip() if visual_query else ""
+        spoken_query = spoken_query.strip() if spoken_query else ""
+        original_query = original_query.strip() if original_query else ""
+        
+        # Prioritize the most specific query available
+        if visual_query and spoken_query:
+            return f"{visual_query} {spoken_query}"
+        elif visual_query:
+            return visual_query
+        elif spoken_query:
+            return spoken_query
+        elif original_query:
+            return original_query
+        else:
+            # Fallback to a generic query if all are empty
+            return "video content"
 
     async def generate_clip(
         self, 
         video_id: str, 
         user_query: str, 
-        index_type: str = "multimodal",
+        index_type: Optional[str] = None,
         include_ranking: bool = True,
         max_duration: int = 240,
         top_n: Optional[int] = 10
     ) -> Dict:
         """Generate a clip based on user query"""
+        # Auto-determine index_type if not provided
+        if index_type is None:
+            from services.scene_index_service import SceneIndexService
+            scene_index_service = SceneIndexService()
+            scene_index_info = scene_index_service.get_scene_index_info(video_id)
+            if scene_index_info:
+                index_type = scene_index_info.index_type
+                logger.info(f"Auto-selected index_type '{index_type}' for video {video_id}")
+            else:
+                # Default to multimodal if no scene index found
+                index_type = "multimodal"
+                logger.warning(f"No scene index found for video {video_id}, using default index_type '{index_type}'")
+        
         logger.info(f"Generating clip for video_id={video_id}, query='{user_query}', index_type={index_type}, include_ranking={include_ranking}, max_duration={max_duration}, top_n={top_n}")
         try:
             
@@ -223,7 +423,7 @@ class ClipService:
         self, 
         video_id: str, 
         user_query: str, 
-        index_type: str = "multimodal",
+        index_type: Optional[str] = None,
         image_id: Optional[str] = None,
         audio_id: Optional[str] = None,
         include_ranking: bool = True,
@@ -241,6 +441,19 @@ class ClipService:
         audio_disable_other_tracks: Optional[bool] = True
     ) -> Dict:
         """Generate a clip with image/audio overlay - simplified version"""
+        # Auto-determine index_type if not provided
+        if index_type is None:
+            from services.scene_index_service import SceneIndexService
+            scene_index_service = SceneIndexService()
+            scene_index_info = scene_index_service.get_scene_index_info(video_id)
+            if scene_index_info:
+                index_type = scene_index_info.index_type
+                logger.info(f"Auto-selected index_type '{index_type}' for video {video_id}")
+            else:
+                # Default to multimodal if no scene index found
+                index_type = "multimodal"
+                logger.warning(f"No scene index found for video {video_id}, using default index_type '{index_type}'")
+        
         logger.info(f"Generating clip with overlay for video_id={video_id}, image_id={image_id}, audio_id={audio_id}")
         try:
             # Generate timeline segments once
@@ -358,31 +571,58 @@ class ClipService:
         return spoken_query, visual_query
 
     def _merge_transcript_intervals(self, intervals):
-        """Helper method to merge overlapping intervals"""
+        """Helper method to merge overlapping intervals with improved efficiency and validation"""
         if not intervals:
             return []
 
-        # Sort intervals by start time
-        intervals.sort(key=lambda x: x[0])
-        merged = [intervals[0]]
+        # Validate and clean intervals
+        valid_intervals = []
+        for interval in intervals:
+            if len(interval) >= 2:
+                start, end = float(interval[0]), float(interval[1])
+                if start < end:  # Only include valid intervals
+                    text = interval[2] if len(interval) > 2 else ""
+                    valid_intervals.append((start, end, text))
+        
+        if not valid_intervals:
+            return []
 
-        for current in intervals[1:]:
+        # Sort intervals by start time for efficient merging
+        valid_intervals.sort(key=lambda x: x[0])
+        merged = [valid_intervals[0]]
+
+        for current in valid_intervals[1:]:
             last = merged[-1]
-            # If intervals overlap or are the same
-            if current[0] <= last[1]:
+            
+            # Check if intervals overlap or are adjacent (within 0.1 seconds)
+            if current[0] <= last[1] + 0.1:
                 # Merge the intervals
                 new_start = last[0]
                 new_end = max(last[1], current[1])
                 
-                # Combine texts if they differ
-                if len(current) > 2 and len(last) > 2 and current[2] != last[2]:
-                    new_text = last[2].strip() + " " + current[2].strip()
+                # Combine texts intelligently
+                last_text = last[2] if len(last) > 2 else ""
+                current_text = current[2] if len(current) > 2 else ""
+                
+                if last_text and current_text and last_text != current_text:
+                    # Avoid duplicate text and ensure proper spacing
+                    if current_text.startswith(last_text):
+                        new_text = current_text
+                    elif last_text.endswith(current_text):
+                        new_text = last_text
+                    else:
+                        new_text = f"{last_text.strip()} {current_text.strip()}"
                 else:
-                    new_text = last[2] if len(last) > 2 else ""
+                    new_text = last_text or current_text
+                
                 merged[-1] = (new_start, new_end, new_text)
             else:
                 merged.append(current)
 
+        # Log merge statistics
+        if len(merged) < len(valid_intervals):
+            logger.debug(f"Merged {len(valid_intervals)} intervals into {len(merged)} segments")
+        
         return merged
 
     def _build_video_timeline(self, video_service, result_timestamps, video_id, top_n=None, max_duration=None):
@@ -425,7 +665,6 @@ class ClipService:
                 text = result_tuple[2] if len(result_tuple) > 2 else ""
                 logger.debug(f"Ranking text with prompt: {prompt[:50]}...")
                 try:
-                    llm = LLM()
                     ranking_prompt = f"""Given the text provided below and a specific User Prompt, evaluate the relevance of the text
                     in relation to the user's prompt. Please assign a relevance score ranging from 0 to 10, where 0 indicates no relevance 
                     and 10 signifies perfect alignment with the user's request.
@@ -454,7 +693,7 @@ class ClipService:
                     # Return JSON: {{"score": <0-10>}}
                     # """
 
-                    response = llm.chat(message=ranking_prompt)
+                    response = self.llm_service.chat(message=ranking_prompt)
                     output = response["choices"][0]["message"]["content"]
                     import json
                     res = json.loads(output)

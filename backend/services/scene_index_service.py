@@ -24,6 +24,13 @@ class SceneIndexService:
             if self.scene_index_file.exists():
                 with open(self.scene_index_file, 'r') as f:
                     data = json.load(f)
+                    
+                    # Migrate old "scene_only" to "scene" index type
+                    for video_id, index_data in data.items():
+                        if index_data.get("index_type") == "scene_only":
+                            index_data["index_type"] = "scene"
+                            logger.info(f"Migrated scene index type from 'scene_only' to 'scene' for video {video_id}")
+                    
                     self.scene_indexes = {
                         video_id: SceneIndexInfo(**index_data) 
                         for video_id, index_data in data.items()

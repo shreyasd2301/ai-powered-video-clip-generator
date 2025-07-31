@@ -52,6 +52,14 @@ async def upload_video(
                 request.scene_extract_time
             )
             logger.info(f"Multimodal indexing scheduled for video_id={video_info['id']} with scene_extract_time={request.scene_extract_time}")
+        elif request.index_type == "scene":
+            background_tasks.add_task(
+                video_service.index_video_scene_only,
+                video_info["id"],
+                request.custom_prompt,
+                request.scene_extract_time
+            )
+            logger.info(f"Scene indexing scheduled for video_id={video_info['id']} with scene_extract_time={request.scene_extract_time}")
         else:
             background_tasks.add_task(
                 video_service.index_video_spoken,

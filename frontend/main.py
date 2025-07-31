@@ -156,7 +156,7 @@ def show_video_upload_page():
             
             index_type = st.selectbox(
                 "Index Type",
-                ["spoken_word", "multimodal"],
+                ["spoken_word", "multimodal", "scene"],
                 help="Choose how the video should be indexed"
             )
             
@@ -172,12 +172,23 @@ def show_video_upload_page():
             st.markdown("""
             - **Spoken Words Only**: Index only the spoken content
             - **Multimodal**: Index both spoken content and visual scenes
+            - **Scene**: Index visual scenes for scene-based search
             - **Custom Prompt**: Define how scenes should be described
             """)
             
             if st.button("🚀 Upload Video", type="primary"):
                 if video_url:
-                    upload_video(video_url, index_type, custom_prompt)
+                    # Show background indexing message immediately
+                    with st.spinner("📤 Uploading video and preparing for indexing..."):
+                        # Show specific indexing type message
+                        current_time = datetime.now().strftime("%H:%M:%S")
+                        if index_type == "multimodal":
+                            st.info(f"🎬 Multimodal indexing will run in the background (spoken words + visual scenes). This may take a few minutes. Started at {current_time}")
+                        elif index_type == "scene":
+                            st.info(f"🎭 Scene indexing will run in the background (visual scenes only). This may take a few minutes. Started at {current_time}")
+                        else:
+                            st.info(f"💬 Spoken word indexing will run in the background. This may take a few minutes. Started at {current_time}")
+                        upload_video(video_url, index_type, custom_prompt)
                 else:
                     st.error("Please enter a video URL")
     
@@ -201,6 +212,10 @@ def show_video_upload_page():
                                 st.success("✅ Multimodal Indexed")
                                 st.caption("Spoken words + Visual scenes")
                                 st.caption(f"Collection: {video.get('collection', 'multimodal')}")
+                            elif video.get('index_type') == 'scene':
+                                st.success("✅ Scene Indexed")
+                                st.caption("Visual scenes for scene search")
+                                st.caption(f"Collection: {video.get('collection', 'multimodal')}")
                             elif video.get('index_type') == 'spoken_word':
                                 st.info("✅ Spoken Words Indexed")
                                 st.caption("Text queries only")
@@ -211,8 +226,8 @@ def show_video_upload_page():
                             st.error("❌ Not Indexed")
                             st.caption(f"Collection: {video.get('collection', 'unknown')}")
                         
-                        # Show additional info for multimodal videos
-                        if video.get('index_type') == 'multimodal' and video.get('custom_prompt'):
+                        # Show additional info for multimodal and scene videos
+                        if video.get('index_type') in ['multimodal', 'scene'] and video.get('custom_prompt'):
                             st.caption("📝 Custom prompt applied")
                         
                         # Show progress for videos being processed
@@ -261,11 +276,15 @@ def show_clip_generation_page():
         col1, col2 = st.columns(2)
         
         with col1:
-            index_type = st.selectbox(
+            # Make index type optional with auto-detect option
+            index_type_option = st.selectbox(
                 "Index Type",
-                ["multimodal", "spoken_word"],
-                help="Use spoken words only or include visual scenes"
+                ["Auto-detect", "multimodal", "spoken_word", "scene"],
+                help="Auto-detect uses the video's original index type, or manually select"
             )
+            
+            # Convert selection to None for auto-detect or the selected value
+            index_type = None if index_type_option == "Auto-detect" else index_type_option
             
             include_ranking = st.checkbox(
                 "Include LLM Ranking",
@@ -284,9 +303,9 @@ def show_clip_generation_page():
                 max_duration = st.number_input(
                     "Max Duration (seconds)",
                     min_value=10,
-                    max_value=300,
+                    max_value=320,
                     value=240,
-                    help="Maximum clip duration"
+                    help="Maximum clip duration (max 320 seconds)"
                 )
             else:
                 max_duration = 240  # Send 240 to backend when disabled
@@ -346,12 +365,36 @@ def show_customization_page():
                 )
                 
                 # Index type selection for overlay
-                index_type = st.selectbox(
+                index_type_option = st.selectbox(
                     "Index Type",
-                    ["multimodal", "spoken_word"],
-                    help="Use spoken words only or include visual scenes",
+                    ["Auto-detect", "multimodal", "spoken_word", "scene"],
+                    help="Auto-detect uses the video's original index type, or manually select",
                     key="overlay_index_type"
                 )
+                
+                # Convert selection to None for auto-detect or the selected value
+                index_type = None if index_type_option == "Auto-detect" else index_type_option
+                
+                # Max duration control for overlay
+                st.markdown("### ⏱️ Duration Settings")
+                enable_max_duration = st.checkbox(
+                    "Enable Max Duration",
+                    value=False,
+                    help="Limit clip duration to specified time",
+                    key="overlay_enable_max_duration"
+                )
+                
+                if enable_max_duration:
+                    max_duration = st.number_input(
+                        "Max Duration (seconds)",
+                        min_value=10,
+                        max_value=320,
+                        value=240,
+                        help="Maximum clip duration (max 320 seconds)",
+                        key="overlay_max_duration"
+                    )
+                else:
+                    max_duration = 240  # Default when disabled
                 
                 # Overlay assets section
                 st.markdown("### 🎨 Overlay Assets")
@@ -423,11 +466,19 @@ def show_customization_page():
                         # Get selected index type
                         selected_index_type = st.session_state.get('overlay_index_type', 'multimodal')
                         
+                        # Get max duration setting
+                        overlay_max_duration = st.session_state.get('overlay_max_duration', 240)
+                        overlay_enable_max_duration = st.session_state.get('overlay_enable_max_duration', False)
+                        
+                        # Use user-specified max duration if enabled, otherwise use 240
+                        final_max_duration = overlay_max_duration if overlay_enable_max_duration else 240
+                        
                         generate_clip_with_overlay(
                             selected_video_id, query, selected_index_type,
                             img_id, aud_id,
                             img_width, img_height, img_x, img_y, img_duration,
-                            aud_start, aud_end, aud_disable
+                            aud_start, aud_end, aud_disable,
+                            final_max_duration
                         )
                     else:
                         st.error("Please enter a query")
@@ -622,7 +673,6 @@ def upload_video(url: str, index_type: str, custom_prompt: str = None):
         if response.status_code == 200:
             video_info = response.json()
             st.success(f"✅ Video uploaded successfully! ID: {video_info['id']}")
-            st.info("Indexing is running in the background. This may take a few minutes.")
         else:
             st.error(f"❌ Failed to upload video: {response.text}")
     
@@ -654,19 +704,26 @@ def delete_video(video_id: str):
     except Exception as e:
         st.error(f"❌ Error deleting video: {str(e)}")
 
-def generate_clip(video_id: str, query: str, index_type: str, include_ranking: bool, max_duration: int, top_n: int):
+def generate_clip(video_id: str, query: str, index_type: Optional[str], include_ranking: bool, max_duration: int, top_n: int):
     try:
         with st.spinner("🎬 Generating clip..."):
             api_key = st.session_state.get('videodb_api_key')
-            response = requests.post(f"{API_BASE_URL}/clips/create", json={
+            
+            # Prepare request payload
+            request_payload = {
                 "video_id": video_id,
                 "user_query": query,
-                "index_type": index_type,
                 "include_ranking": include_ranking,
                 "max_duration": max_duration,
                 "top_n": top_n,
                 "api_key": api_key
-            })
+            }
+            
+            # Only include index_type if it's not None
+            if index_type is not None:
+                request_payload["index_type"] = index_type
+            
+            response = requests.post(f"{API_BASE_URL}/clips/create", json=request_payload)
         
         if response.status_code == 200:
             clip_info = response.json()
@@ -679,6 +736,7 @@ def generate_clip(video_id: str, query: str, index_type: str, include_ranking: b
                 st.markdown(f"**Clip ID:** {clip_info['id']}")
                 st.markdown(f"**Duration:** {clip_info['duration']:.1f}s")
                 st.markdown(f"**Segments:** {clip_info.get('segments_count', 0)}")
+                st.markdown(f"**Index Type:** {clip_info.get('index_type', 'auto-detected')}")
             
             with col2:
                 if clip_info.get('stream_url'):
@@ -690,18 +748,20 @@ def generate_clip(video_id: str, query: str, index_type: str, include_ranking: b
     except Exception as e:
         st.error(f"❌ Error generating clip: {str(e)}")
 
-def generate_clip_with_overlay(video_id: str, query: str, index_type: str, image_id: str = None, audio_id: str = None,
+def generate_clip_with_overlay(video_id: str, query: str, index_type: Optional[str], image_id: str = None, audio_id: str = None,
                               image_width: int = 40, image_height: int = 40, image_x: int = 20, image_y: int = 10, image_duration: int = 7,
-                              audio_start: int = 3, audio_end: int = 4, audio_disable_other_tracks: bool = True):
+                              audio_start: int = 3, audio_end: int = 4, audio_disable_other_tracks: bool = True,
+                              max_duration: int = 240):
     try:
         with st.spinner("🎬 Generating clip with overlay..."):
             api_key = st.session_state.get('videodb_api_key')
-            response = requests.post(f"{API_BASE_URL}/clips/create-with-overlay", json={
+            
+            # Prepare request payload
+            request_payload = {
                 "video_id": video_id,
                 "user_query": query,
-                "index_type": index_type,
                 "include_ranking": True,
-                "max_duration": 240,
+                "max_duration": max_duration,
                 "top_n": 10,
                 "api_key": api_key,
                 # Image overlay metadata
@@ -716,14 +776,30 @@ def generate_clip_with_overlay(video_id: str, query: str, index_type: str, image
                 "audio_start": audio_start,
                 "audio_end": audio_end,
                 "audio_disable_other_tracks": audio_disable_other_tracks
-            })
+            }
+            
+            # Only include index_type if it's not None
+            if index_type is not None:
+                request_payload["index_type"] = index_type
+            
+            response = requests.post(f"{API_BASE_URL}/clips/create-with-overlay", json=request_payload)
         
         if response.status_code == 200:
             clip_info = response.json()
             st.success("✅ Clip with overlay generated successfully!")
             
-            if clip_info.get('stream_url'):
-                st.markdown(f"[🎬 Watch Clip]({clip_info['stream_url']})")
+            # Display clip info
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown(f"**Clip ID:** {clip_info['id']}")
+                st.markdown(f"**Duration:** {clip_info['duration']:.1f}s")
+                st.markdown(f"**Index Type:** {clip_info.get('index_type', 'auto-detected')}")
+            
+            with col2:
+                if clip_info.get('stream_url'):
+                    st.markdown(f"**Stream URL:** {clip_info['stream_url']}")
+                    st.markdown(f"[🎬 Watch Clip]({clip_info['stream_url']})")
         else:
             st.error(f"❌ Failed to generate clip: {response.text}")
     

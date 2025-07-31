@@ -4,7 +4,7 @@ A powerful video clip generation application built with FastAPI backend and Stre
 
 ## 🚀 Features
 
-- **Smart Video Upload**: Upload videos from YouTube or other sources
+- **Video Upload**: Upload videos from YouTube
 - **Intelligent Indexing**: Index videos for spoken words and/or visual scenes
 - **AI-Powered Clip Generation**: Generate clips using natural language queries
 - **Multimodal Processing**: Support for both spoken content and visual scene analysis
@@ -25,7 +25,7 @@ A powerful video clip generation application built with FastAPI backend and Stre
 1. **Clone the repository**
    ```bash
    git clone <repository-url>
-   cd ai-powered-clip-generator
+   cd ai-powered-video-clip-generator
    ```
 
 2. **Set up environment variables**
@@ -35,7 +35,6 @@ A powerful video clip generation application built with FastAPI backend and Stre
    
    Edit `.env` file with your API keys:
    ```env
-   VIDEO_DB_API_KEY="your-videodb-api-key"
    OPENAI_API_KEY="your-openai-api-key"
    ```
 
